@@ -1,5 +1,6 @@
+# ingestion/scraper.py
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from google_play_scraper import reviews, Sort
 
@@ -35,26 +36,34 @@ def scrape_and_store_reviews(
     app_id,
     package_name,
     count=200,
-    max_pages=20,
-    max_reviews=5000
+    days_back=180,
+    max_pages=100,
+    max_reviews=20000,
 ):
     """
-    Scrape Google Play reviews using pagination
-    and store them in the reviews table.
+    Scrape Google Play reviews using pagination, stopping once
+    reviews older than `days_back` days are reached.
+
+    max_pages / max_reviews are safety backstops only — they
+    should rarely be the actual reason the loop stops for a
+    normal app.
     """
+    cutoff_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days_back)
+    print(f"Target cutoff date: {cutoff_date.isoformat()}")
+
     continuation_token = None
     page_count = 0
     processed_reviews = 0
     inserted_reviews = 0
+    reached_cutoff = False
 
     while continuation_token is not None or page_count == 0:
 
         if page_count >= max_pages:
-            print("Maximum page limit reached.")
+            print("Safety limit hit: maximum page count reached.")
             break
-
         if processed_reviews >= max_reviews:
-            print("Maximum review limit reached.")
+            print("Safety limit hit: maximum review count reached.")
             break
 
         page_count += 1
@@ -66,7 +75,7 @@ def scrape_and_store_reviews(
             country="us",
             sort=Sort.NEWEST,
             count=count,
-            continuation_token=continuation_token
+            continuation_token=continuation_token,
         )
 
         if not result:
@@ -74,7 +83,12 @@ def scrape_and_store_reviews(
             break
 
         for review in result:
-            if processed_reviews >= max_reviews:
+            review_date = review["at"]
+
+            # This review (and everything after it in this page,
+            # since it's sorted newest -> oldest) is past our window.
+            if review_date < cutoff_date:
+                reached_cutoff = True
                 break
 
             review_id = review["reviewId"]
@@ -84,7 +98,6 @@ def scrape_and_store_reviews(
             reply_content = review.get("replyContent")
             replied_at = review.get("repliedAt")
             app_version = review.get("appVersion")
-            review_date = review["at"].isoformat()
             scraped_at = datetime.now(timezone.utc).isoformat()
 
             cursor = conn.execute(
@@ -100,7 +113,7 @@ def scrape_and_store_reviews(
                     review_id, app_id, content, score, thumbs_up_count,
                     reply_content,
                     replied_at.isoformat() if replied_at else None,
-                    app_version, review_date, scraped_at
+                    app_version, review_date.isoformat(), scraped_at,
                 )
             )
 
@@ -110,12 +123,15 @@ def scrape_and_store_reviews(
 
         conn.commit()
         print(
-            f"Page {page_count}: {len(result)} reviews processed, "
+            f"Page {page_count}: {processed_reviews} reviews processed so far, "
             f"{inserted_reviews} new reviews inserted so far."
         )
 
+        if reached_cutoff:
+            print(f"Reached {days_back}-day cutoff. Stopping.")
+            break
         if continuation_token is None:
-            print("No more pages available.")
+            print("No more pages available (exhausted all reviews).")
             break
 
         time.sleep(1)
