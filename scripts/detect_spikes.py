@@ -20,7 +20,12 @@ def load_data():
         JOIN apps a ON r.app_id = a.app_id
     """, conn)
     conn.close()
-    df["review_date"] = pd.to_datetime(df["review_date"])
+    df["review_date"] = pd.to_datetime(
+    df["review_date"],
+    format="mixed",
+    errors="coerce"
+)
+    
     df["week"] = df["review_date"].dt.to_period("W").apply(lambda p: p.start_time)
     df["month"] = df["review_date"].dt.to_period("M").apply(lambda p: p.start_time)
     return df
