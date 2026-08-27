@@ -18,6 +18,11 @@ def summary():
 
     total_reviews = conn.execute("""
         SELECT COUNT(*) AS c
+        FROM reviews
+    """).fetchone()["c"]
+
+    window_total = conn.execute("""
+        SELECT COUNT(*) AS c
         FROM reviews_trend_window
     """).fetchone()["c"]
 
@@ -45,7 +50,8 @@ def summary():
     conn.close()
 
     return {
-        "total_reviews_last_180_days": total_reviews,
+        "total_reviews": total_reviews,
+        "total_reviews_last_180_days": window_total,
         "sentiment_breakdown": sentiment_counts,
         "per_app": per_app,
     }
