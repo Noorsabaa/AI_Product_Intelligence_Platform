@@ -14,6 +14,11 @@ def run_sentiment(batch_size=32, commit_every=200):
     """).fetchall()
     print(f"Rows to process: {len(rows)}")
 
+    if not rows:
+        conn.close()
+        print("No sentiment work pending.")
+        return
+
     clf = pipeline("sentiment-analysis", model=MODEL, tokenizer=MODEL)
 
     processed = 0
