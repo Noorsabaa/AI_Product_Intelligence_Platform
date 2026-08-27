@@ -8,7 +8,7 @@ from google.genai import errors as genai_errors
 from dotenv import load_dotenv
 
 load_dotenv()
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"]) if os.getenv("GEMINI_API_KEY") else None
 MODEL_NAME = "gemini-3.6-flash"
 
 DB_PATH = "data/reviews.db"
@@ -61,7 +61,21 @@ def load_existing_results():
     return pd.DataFrame()
 
 
+def local_recommendation(row, reviews):
+    """Return a useful quota-free brief based only on the detected spike."""
+    evidence = reviews[0][:160] if reviews else "the available review sample"
+    return (
+        f"WHAT HAPPENED: Complaints about {row['category']} increased to "
+        f"{int(row['count'])} in {row['period']}, {float(row['pct_change']):.0f}% above baseline. "
+        f"Example feedback: {evidence}\n"
+        "RECOMMENDED ACTION: Review the affected cases and confirm whether the issue "
+        "is concentrated in a release, app version, device, or customer segment before prioritizing a fix."
+    )
+
+
 def generate_recommendations():
+    global client
+
     spikes = pd.read_csv(SPIKES_CSV)
     existing = load_existing_results()
     done_keys = set()
@@ -89,22 +103,28 @@ def generate_recommendations():
         )
 
         try:
+            if client is None:
+                raise RuntimeError("GEMINI_API_KEY is not configured")
             response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
             brief = response.text.strip()
         except genai_errors.ClientError as e:
             if "RESOURCE_EXHAUSTED" in str(e):
-                print("Daily/rate quota hit. Stopping here — rerun later to resume.")
-                break
-            brief = f"ERROR generating brief: {e}"
+                print("Gemini quota reached; using local recommendations for remaining spikes.")
+                brief = local_recommendation(row, reviews)
+                client = None
+            else:
+                brief = local_recommendation(row, reviews)
         except Exception as e:
-            brief = f"ERROR generating brief: {e}"
+            print(f"Gemini unavailable ({e}); using local recommendation.")
+            brief = local_recommendation(row, reviews)
 
         print(f"\n=== {row['app_name']} | {row['category']} | {row['period']} ===")
         print(brief)
         results.append({**row.to_dict(), "brief": brief})
 
         pd.DataFrame(results).to_csv(OUTPUT_CSV, index=False)  # save after every call
-        time.sleep(DELAY_BETWEEN_CALLS)
+        if client is not None:
+            time.sleep(DELAY_BETWEEN_CALLS)
 
     conn.close()
     print(f"\nSaved {len(results)} briefs total to {OUTPUT_CSV}")
