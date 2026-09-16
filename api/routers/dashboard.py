@@ -1,108 +1,41 @@
-import sqlite3
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
+from services.intelligence import dashboard, load_scope
+from services.reports import csv_feedback
+from services.storage import database, active_run
 
 router = APIRouter()
 
-DB_PATH = "data/reviews.db"
+@router.get('/overview')
+def overview(days: int = Query(90, ge=0, le=730), topic_id: str = ''):
+    return dashboard(days, topic_id)
 
+@router.get('/reviews')
+def reviews(days: int = Query(90,ge=0,le=730), topic_id: str = '', sentiment: str = '',
+            search: str = Query('',max_length=200), page: int = Query(1,ge=1), limit: int = Query(20,ge=1,le=100), run_id: str = ''):
+    rows, scope, _ = load_scope(days,topic_id,sentiment,search)
+    if run_id and (scope['published_run'] or {}).get('id') != run_id:
+        raise HTTPException(409, 'Analysis has changed. Close this panel and refresh the dashboard.')
+    return {'reviews':rows[(page-1)*limit:page*limit], 'total':len(rows), 'page':page, 'limit':limit}
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+@router.get('/export')
+def export(days: int = Query(90,ge=0,le=730), topic_id: str = '', sentiment: str = '', search: str = ''):
+    rows,_,_ = load_scope(days,topic_id,sentiment,search)
+    return Response(csv_feedback(rows), media_type='text/csv', headers={'Content-Disposition':'attachment; filename=customer-feedback.csv'})
 
+class TopicName(BaseModel):
+    label: str = Field(min_length=1,max_length=100)
 
-@router.get("/summary")
-def summary():
-    conn = get_conn()
-
-    total_reviews = conn.execute("""
-        SELECT COUNT(*) AS c
-        FROM reviews
-    """).fetchone()["c"]
-
-    window_total = conn.execute("""
-        SELECT COUNT(*) AS c
-        FROM reviews_trend_window
-    """).fetchone()["c"]
-
-    sentiment_counts = dict(conn.execute("""
-        SELECT sentiment, COUNT(*) AS c
-        FROM reviews_trend_window
-        WHERE sentiment IS NOT NULL
-        GROUP BY sentiment
-    """).fetchall())
-
-    per_app = [
-        dict(row)
-        for row in conn.execute("""
-            SELECT
-                a.app_name,
-                COUNT(*) AS review_count,
-                ROUND(AVG(r.score), 2) AS avg_score
-            FROM reviews_trend_window r
-            JOIN apps a ON r.app_id = a.app_id
-            GROUP BY a.app_name
-            ORDER BY review_count DESC
-        """).fetchall()
-    ]
-
-    conn.close()
-
-    return {
-        "total_reviews": total_reviews,
-        "total_reviews_last_180_days": window_total,
-        "sentiment_breakdown": sentiment_counts,
-        "per_app": per_app,
-    }
-
-
-@router.get("/categories")
-def categories():
-    conn = get_conn()
-
-    rows = [
-        dict(row)
-        for row in conn.execute("""
-            SELECT
-                category,
-                COUNT(*) AS count
-            FROM reviews_categorized_confident
-            GROUP BY category
-            ORDER BY count DESC
-        """).fetchall()
-    ]
-
-    conn.close()
-
-    return {
-        "categories": rows
-    }
-
-@router.get("/spikes")
-def spikes():
-    try:
-        import pandas as pd
-
-        df = pd.read_csv("scratch/detected_spikes.csv")
-
-    except FileNotFoundError:
-        return {"spikes": []}
-
-    return {
-        "spikes": df.to_dict("records")
-    }
-
-@router.get("/recommendations")
-def recommendations():
-    try:
-        import pandas as pd
-
-        df = pd.read_csv("scratch/recommendations.csv")
-
-    except FileNotFoundError:
-        return {"recommendations": []}
-
-    return {
-        "recommendations": df.to_dict("records")
-    }
+@router.patch('/categories/{topic_id}')
+def rename(topic_id: str, body: TopicName):
+    if not body.label.strip():
+        raise HTTPException(422,'Category name cannot be blank.')
+    with database() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if active_run(conn):
+            raise HTTPException(409,'Wait for analysis to finish before renaming a category.')
+        result=conn.execute('UPDATE discovered_topics SET custom_label=? WHERE id=?',(body.label.strip(),topic_id))
+        if not result.rowcount:
+            raise HTTPException(404,'Category not found.')
+    return {'id':topic_id,'label':body.label.strip()}
